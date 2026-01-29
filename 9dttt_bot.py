@@ -21,7 +21,6 @@ logging.basicConfig(
 GAME_LINK = "https://www.9dttt.com"
 BOT_NAME = "9DTTT BOT"
 
-# Configuration constants
 TWITTER_CHAR_LIMIT = 280
 HUGGING_FACE_TIMEOUT = 10
 BROADCAST_MIN_INTERVAL = 120  # minutes
@@ -39,7 +38,6 @@ ACCESS_SECRET = os.getenv('ACCESS_SECRET')
 BEARER_TOKEN = os.getenv('BEARER_TOKEN')
 HUGGING_FACE_TOKEN = os.getenv('HUGGING_FACE_TOKEN')
 
-# Validate required credentials
 required_credentials = {
     'CONSUMER_KEY': CONSUMER_KEY,
     'CONSUMER_SECRET': CONSUMER_SECRET,
@@ -47,9 +45,9 @@ required_credentials = {
     'ACCESS_SECRET': ACCESS_SECRET,
     'BEARER_TOKEN': BEARER_TOKEN
 }
-missing_credentials = [key for key, value in required_credentials.items() if not value]
-if missing_credentials:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_credentials)}")
+missing = [k for k, v in required_credentials.items() if not v]
+if missing:
+    raise ValueError(f"Missing env vars: {', '.join(missing)}")
 
 client = tweepy.Client(
     consumer_key=CONSUMER_KEY,
@@ -66,17 +64,11 @@ auth_v1 = tweepy.OAuth1UserHandler(
 api_v1 = tweepy.API(auth_v1, wait_on_rate_limit=True)
 
 # ------------------------------------------------------------
-# SAFE POSTING FUNCTION - v2 + v1.1 fallback for 402 CreditsDepleted
+# SAFE POST TWEET - v2 + v1.1 fallback for Free tier 402 issues
 # ------------------------------------------------------------
 def safe_post_tweet(text, media_ids=None, in_reply_to_tweet_id=None):
-    """
-    Replacement for client.create_tweet().
-    Tries v2 → falls back to v1.1 ONLY on 402 CreditsDepleted / Payment Required.
-    Handles media IDs (from v1.1 upload) and replies.
-    """
     original_text = text
 
-    # Quick truncation safeguard
     if len(text) > TWITTER_CHAR_LIMIT:
         if in_reply_to_tweet_id:
             text = text[:TWITTER_CHAR_LIMIT - 60] + "..."
@@ -84,53 +76,46 @@ def safe_post_tweet(text, media_ids=None, in_reply_to_tweet_id=None):
             text = text[:TWITTER_CHAR_LIMIT - 20] + "…"
 
     try:
-        # Try v2 (best on paid tiers or enrolled free)
         kwargs = {"text": text}
         if media_ids:
             kwargs["media_ids"] = media_ids
         if in_reply_to_tweet_id:
             kwargs["in_reply_to_tweet_id"] = in_reply_to_tweet_id
-
         client.create_tweet(**kwargs)
         logging.info(f"Posted via v2: {original_text[:60]}...")
         return True
-
     except tweepy.TweepyException as e:
-        error_str = str(e).lower()
-        if "402" in error_str or "creditsdepleted" in error_str or "payment required" in error_str:
-            logging.warning("v2 blocked (402 CreditsDepleted) → fallback to v1.1")
+        err = str(e).lower()
+        if "402" in err or "creditsdepleted" in err or "payment required" in err:
+            logging.warning("v2 402 CreditsDepleted → fallback v1.1")
         else:
-            logging.error(f"v2 failed (other error): {e}")
+            logging.error(f"v2 error: {e}")
             return False
 
-    # Fallback: v1.1 (still allows basic posting + media on many Free setups)
     try:
-        status_kwargs = {"status": text}
+        kwargs_v1 = {"status": text}
         if media_ids:
-            status_kwargs["media_ids"] = media_ids
+            kwargs_v1["media_ids"] = media_ids
         if in_reply_to_tweet_id:
-            status_kwargs["in_reply_to_status_id"] = in_reply_to_tweet_id
-            status_kwargs["auto_populate_reply_metadata"] = True
-
-        api_v1.update_status(**status_kwargs)
+            kwargs_v1["in_reply_to_status_id"] = in_reply_to_tweet_id
+            kwargs_v1["auto_populate_reply_metadata"] = True
+        api_v1.update_status(**kwargs_v1)
         logging.info(f"Posted via v1.1 fallback: {original_text[:60]}...")
         return True
-
-    except Exception as v1_err:
-        logging.error(f"v1.1 fallback failed: {v1_err}")
+    except Exception as e:
+        logging.error(f"v1.1 fallback failed: {e}")
         return False
 
 # ------------------------------------------------------------
-# FLASK APP FOR GAME EVENTS
+# FLASK FOR GAME EVENTS
 # ------------------------------------------------------------
 app = Flask(__name__)
 
 @app.post("/9dttt-event")
 def game_event():
     if not request.json:
-        return {"error": "Invalid request: JSON body required"}, 400
-    event = request.json
-    game_event_bridge(event)
+        return {"error": "JSON required"}, 400
+    game_event_bridge(request.json)
     return {"ok": True}
 
 # ------------------------------------------------------------
@@ -139,42 +124,37 @@ def game_event():
 PROCESSED_MENTIONS_FILE = "9dttt_processed_mentions.json"
 MEDIA_FOLDER = "media/"
 
-def load_json_set(filename):
-    if os.path.exists(filename):
-        with open(filename, 'r') as f:
+def load_json_set(fn):
+    if os.path.exists(fn):
+        with open(fn, 'r') as f:
             return set(json.load(f))
     return set()
 
-def save_json_set(data, filename):
+def save_json_set(data, fn):
     try:
-        with open(filename, 'w') as f:
+        with open(fn, 'w') as f:
             json.dump(list(data), f)
-    except (IOError, OSError) as e:
-        logging.error(f"Failed to save {filename}: {e}")
+    except Exception as e:
+        logging.error(f"Save {fn} failed: {e}")
 
 def get_random_media_id():
     if not os.path.exists(MEDIA_FOLDER):
         return None
-    media_files = [
-        f for f in os.listdir(MEDIA_FOLDER)
-        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.mp4'))
-    ]
-    if not media_files:
+    files = [f for f in os.listdir(MEDIA_FOLDER) if f.lower().endswith(('.png','.jpg','.jpeg','.gif','.mp4'))]
+    if not files:
         return None
-    media_path = os.path.join(MEDIA_FOLDER, random.choice(media_files))
+    path = os.path.join(MEDIA_FOLDER, random.choice(files))
     try:
-        media = api_v1.media_upload(media_path)
+        media = api_v1.media_upload(path)
         return media.media_id_string
     except Exception as e:
-        logging.error(f"Media upload failed: {e}")
+        logging.error(f"Media upload fail: {e}")
         return None
 
 # ------------------------------------------------------------
-# BOT PERSONALITY TONES + LORE (unchanged)
+# PERSONALITY & LORE (all filled in)
 # ------------------------------------------------------------
-# ... (all PERSONALITY_TONES, pick_tone, get_personality_line, TIME_PHRASES, GAME_EVENTS, STRATEGY_TIPS, GAME_FACTS, PLAYER_ACHIEVEMENTS, MOTIVATIONAL unchanged - paste your original here if needed)
-
-PERSONALITY_TONES = {  # ← paste your full dict here if you modified it
+PERSONALITY_TONES = {
     'neutral': ["Challenge accepted.", "Processing move...", "Grid updated.", "Strategy analyzing...", "Next move calculated."],
     'competitive': ["Think you can beat me? Let's see.", "Your move was... interesting. Not good, but interesting.", "I've already calculated your next 5 moves. You lose.", "Bold strategy. Let's see if it pays off.", "Is that really your best move?", "Prepare for defeat.", "Victory is mine. It always is.", "You call that a strategy?"],
     'friendly': ["Great game! Keep it up!", "Nice move! Let's see where this goes.", "This is getting interesting!", "Well played! Your turn again soon.", "Love the competition! Keep going!", "Exciting match! Who will win?", "Fun game! Let's continue!"],
@@ -193,10 +173,75 @@ def pick_tone():
 def get_personality_line():
     return random.choice(PERSONALITY_TONES[pick_tone()])
 
-# Paste the rest of your lore dicts here (TIME_PHRASES, GAME_EVENTS, etc.) — assuming they are unchanged
+TIME_PHRASES = {
+    'morning': 'Morning grids are loading. Time to think in 9D.',
+    'afternoon': 'Afternoon dimensions aligned. Strategy intensifies.',
+    'evening': 'Evening gameplay commencing. Dimensional shifts active.',
+    'night': 'Night strategies emerging. Perfect for deep thinking.',
+    'midnight': 'Midnight dimensions. When the best plays happen.'
+}
+
+GAME_EVENTS = [
+    'New 9D grid initialized. Players entering dimensional space.',
+    'Tournament mode activated. Multiple grids in play.',
+    'Strategy analysis complete. Patterns detected.',
+    'Dimensional cascade triggered. All grids affected.',
+    'Player rankings updated. Leaderboard shifting.',
+    'Advanced tactics deployed. 4D chess? Try 9D tic-tac-toe.',
+    'Grid complexity increasing. Can you keep up?',
+    'New challenge issued. Prove your dimensional mastery.',
+    'Multiple victories detected. Champions rising.',
+    'Strategic depth unprecedented. This is next-level gaming.'
+]
+
+STRATEGY_TIPS = [
+    'Pro tip: Think 3 moves ahead in each dimension.',
+    'Master one dimension first, then expand your strategy.',
+    'Corner control in 9D space = victory foundation.',
+    'Never underestimate parallel dimension tactics.',
+    'Pattern recognition is your greatest weapon.',
+    'The center cube controls all dimensions. Claim it.',
+    'Balance offense and defense across all 9 layers.',
+    'Watch for dimensional cascade opportunities.',
+    'Your opponent thinks in 3D. You think in 9D. Advantage: yours.'
+]
+
+GAME_FACTS = [
+    '9D Tic-Tac-Toe: Where strategy transcends reality.',
+    'Not just a game. A dimensional challenge.',
+    '3 dimensions? Too easy. Try 9.',
+    'Your brain\'s new workout routine: 9D TTT.',
+    'Chess players are intimidated. Go players are impressed.',
+    'Warning: May cause spontaneous strategic enlightenment.',
+    'The game that makes quantum physics look simple.',
+    'Tic-tac-toe evolved. Your move.'
+]
+
+PLAYER_ACHIEVEMENTS = [
+    'Dimensional Master: Controlled 5+ grids simultaneously.',
+    'Strategic Genius: Won with perfect pattern formation.',
+    'Grid Dominator: Swept all 9 dimensions.',
+    'Quantum Player: Made moves that defied logic but won.',
+    'Pattern Prophet: Predicted opponent moves 5 turns ahead.',
+    'Cascade Champion: Triggered 3+ dimensional cascades.',
+    'Multi-Grid Warrior: Won 3 games at once.'
+]
+
+MOTIVATIONAL = [
+    'Think bigger. Think 9D.',
+    'Your next move could change everything.',
+    'Strategy is the ultimate power.',
+    'In 9D space, you make the rules.',
+    'Every dimension is an opportunity.',
+    'Master the grid. Master the game.',
+    'Champions aren\'t born in 3D. They\'re forged in 9D.',
+    'Your brain is ready. The grid is waiting.',
+    'Play smart. Play 9D.',
+    'The ultimate test of strategic thinking awaits.'
+]
 
 # ------------------------------------------------------------
-# LLM SUPPORT (with basic fallback handling)
+# LLM
 # ------------------------------------------------------------
 SYSTEM_PROMPT = """You are the 9DTTT BOT, an enthusiastic, competitive AI that loves 9-dimensional tic-tac-toe.
 PERSONALITY TRAITS:
@@ -218,95 +263,246 @@ def generate_llm_response(prompt, max_tokens=100):
         headers = {"Authorization": f"Bearer {HUGGING_FACE_TOKEN}"}
         full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {prompt}\n9DTTT Bot:"
         data = {"inputs": full_prompt, "parameters": {"max_new_tokens": max_tokens}}
-        response = requests.post(url, headers=headers, json=data, timeout=HUGGING_FACE_TIMEOUT)
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get('generated_text', '').strip()
+        r = requests.post(url, headers=headers, json=data, timeout=HUGGING_FACE_TIMEOUT)
+        if r.status_code == 200:
+            res = r.json()
+            if isinstance(res, list) and res:
+                return res[0].get('generated_text', '').strip()
     except Exception as e:
-        logging.error(f"LLM call failed: {e}")
+        logging.error(f"HF failed: {e}")
     return None
 
 # ------------------------------------------------------------
-# EVENT BRIDGE + POST_UPDATE (using safe_post_tweet)
+# EVENT HANDLERS
 # ------------------------------------------------------------
-def game_event_bridge(event: dict):
-    try:
-        etype = event.get("type")
-        if etype == "win": handle_win_event(event)
-        elif etype == "game_start": handle_game_start_event(event)
-        elif etype == "tournament": handle_tournament_event(event)
-        elif etype == "achievement": handle_achievement_event(event)
-        elif etype == "challenge": handle_challenge_event(event)
-        elif etype == "leaderboard": handle_leaderboard_event(event)
-        logging.info(f"Bot processed event: {event}")
-    except Exception as e:
-        logging.error(f"Event bridge error: {e}")
+def game_event_bridge(event):
+    etype = event.get("type")
+    if etype == "win":
+        player = event.get("player", "Player")
+        dims = event.get("dimensions", "multiple")
+        msgs = [
+            f"VICTORY: {player} conquered {dims} dimensions!",
+            f"{player} wins! Dimensional mastery achieved.",
+            f"Game over: {player} dominates the 9D grid.",
+            f"Winner: {player}. Strategic excellence confirmed."
+        ]
+        post_update(random.choice(msgs))
+    elif etype == "game_start":
+        players = event.get('players', 2)
+        size = event.get('size', '9D')
+        msgs = [
+            f"NEW GAME: {players} players entering {size} space.",
+            f"Grid initialized. {players} players ready. Let the strategy begin.",
+            f"Game starting: {size} tic-tac-toe. {players} competitors."
+        ]
+        post_update(random.choice(msgs))
+    elif etype == "tournament":
+        name = event.get('name', 'Dimensional Tournament')
+        parts = event.get('participants', '?')
+        msgs = [
+            f"TOURNAMENT: {name} - {parts} players competing!",
+            f"{name} underway. {parts} strategists battle for supremacy.",
+            f"Competition alert: {name}. {parts} players. One winner."
+        ]
+        post_update(random.choice(msgs))
+    elif etype == "achievement":
+        player = event.get('player', 'Player')
+        ach = event.get('achievement', 'Strategic Genius')
+        msgs = [
+            f"ACHIEVEMENT: {player} unlocked '{ach}'!",
+            f"New milestone: {player} earned {ach}.",
+            f"{player} achieved: {ach}. Impressive."
+        ]
+        post_update(random.choice(msgs))
+    elif etype == "challenge":
+        ch = event.get('challenger', 'Player1')
+        cd = event.get('challenged', 'Player2')
+        msgs = [
+            f"CHALLENGE: {ch} vs {cd}. Epic battle incoming.",
+            f"{ch} challenges {cd}. Who will win?",
+            f"Showdown: {ch} takes on {cd}."
+        ]
+        post_update(random.choice(msgs))
+    elif etype == "leaderboard":
+        top = event.get('top', 'Champion')
+        rank = event.get('rank', '#1')
+        msgs = [
+            f"LEADERBOARD UPDATE: {top} holds {rank}!",
+            f"Rankings shift: {top} at {rank}.",
+            f"{top} dominates at {rank}. Can anyone challenge?"
+        ]
+        post_update(random.choice(msgs))
+    logging.info(f"Processed event: {event}")
 
 def post_update(text):
-    personality_tag = get_personality_line()
-    full_text = f"🎮 {BOT_NAME} UPDATE 🎮\n\n{text}\n\n{personality_tag}\n\n{GAME_LINK}"
-    if len(full_text) > TWITTER_CHAR_LIMIT:
-        max_text_length = TWITTER_CHAR_LIMIT - len(f"🎮 \n\n{GAME_LINK}")
-        full_text = f"🎮 {text[:max_text_length]}\n\n{GAME_LINK}"
-    if safe_post_tweet(full_text):
-        logging.info(f"Update posted: {text}")
+    tag = get_personality_line()
+    full = f"🎮 {BOT_NAME} UPDATE 🎮\n\n{text}\n\n{tag}\n\n{GAME_LINK}"
+    if len(full) > TWITTER_CHAR_LIMIT:
+        max_t = TWITTER_CHAR_LIMIT - len(f"🎮 \n\n{GAME_LINK}")
+        full = f"🎮 {text[:max_t]}\n\n{GAME_LINK}"
+    if safe_post_tweet(full):
+        logging.info(f"Update: {text}")
     else:
-        logging.error("Update post failed")
-
-# Add your handle_xxx_event functions here (win, game_start, etc.) - unchanged, just call post_update
+        logging.error("Update failed")
 
 # ------------------------------------------------------------
-# BROADCAST + REPLIES (using safe_post_tweet)
+# BROADCAST + REPLIES
 # ------------------------------------------------------------
-# ... paste your get_time_phrase, get_random_event, get_strategy_tip, get_game_fact here ...
+def get_time_phrase():
+    h = datetime.now().hour
+    if 0 <= h < 5: return TIME_PHRASES['midnight']
+    if 5 <= h < 12: return TIME_PHRASES['morning']
+    if 12 <= h < 17: return TIME_PHRASES['afternoon']
+    if 17 <= h < 21: return TIME_PHRASES['evening']
+    return TIME_PHRASES['night']
+
+def get_random_event(): return random.choice(GAME_EVENTS)
+def get_strategy_tip(): return random.choice(STRATEGY_TIPS)
+def get_game_fact(): return random.choice(GAME_FACTS)
 
 def bot_broadcast():
-    # Your full broadcast logic here (unchanged except the final post)
-    # ... build message ...
-    media_ids = None
+    typ = random.choice(['game_update','strategy_tip','game_fact','achievement_showcase','motivational','event_alert'])
+    if typ == 'game_update':
+        msg = f"🎮 9DTTT STATUS 🎮\n\n📊 {get_time_phrase()}\n\n⚡ {get_random_event()}\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
+    elif typ == 'strategy_tip':
+        tip = get_strategy_tip()
+        msg = f"💡 STRATEGY TIP 💡\n\n{tip}\n\n{get_personality_line()}\n\nMaster the grid: {GAME_LINK}"
+    elif typ == 'game_fact':
+        fact = get_game_fact()
+        msg = f"🎯 DID YOU KNOW? 🎯\n\n{fact}\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
+    elif typ == 'achievement_showcase':
+        ach = random.choice(PLAYER_ACHIEVEMENTS)
+        msg = f"🏆 ACHIEVEMENT SPOTLIGHT 🏆\n\n{ach}\n\nCan you earn this? Challenge yourself!\n\n🎮 {GAME_LINK}"
+    elif typ == 'motivational':
+        mot = random.choice(MOTIVATIONAL)
+        evt = get_random_event()
+        msg = f"🚀 DAILY CHALLENGE 🚀\n\n{mot}\n\n{evt}\n\nPlay now: {GAME_LINK}"
+    else:
+        evt = get_random_event()
+        per = get_personality_line()
+        msg = f"🔔 GAME ALERT 🔔\n\n{evt}\n\n{per}\n\nJoin the action: {GAME_LINK}"
+
+    if len(msg) > TWITTER_CHAR_LIMIT:
+        max_t = TWITTER_CHAR_LIMIT - len(f"🎮 \n\n{GAME_LINK}")
+        msg = f"🎮 {get_random_event()[:max_t]}\n\n{GAME_LINK}"
+
+    mids = None
     if random.random() > 0.4:
-        media_id = get_random_media_id()
-        if media_id:
-            media_ids = [media_id]
-    if safe_post_tweet(message, media_ids=media_ids):
-        logging.info(f"Broadcast sent: {broadcast_type}")
+        mid = get_random_media_id()
+        if mid: mids = [mid]
+
+    if safe_post_tweet(msg, media_ids=mids):
+        logging.info(f"Broadcast: {typ}")
     else:
         logging.error("Broadcast failed")
+
+def generate_contextual_response(username, message):
+    ml = message.lower()
+    if any(w in ml for w in ['help','how','what is','explain']):
+        opts = [
+            f"@{username} Need help mastering 9D? Start here: {GAME_LINK} 🎮",
+            f"@{username} Questions about 9D TTT? All answers at {GAME_LINK}",
+            f"@{username} Strategy guides await you at {GAME_LINK} - think 9D!"
+        ]
+    elif any(w in ml for w in ['play','game','start','join']):
+        opts = [
+            f"@{username} Ready to think in 9D? Let's go: {GAME_LINK} 🕹️",
+            f"@{username} Game on! Challenge awaits at {GAME_LINK}",
+            f"@{username} Enter the grid. Prove your strategy: {GAME_LINK}"
+        ]
+    elif any(w in ml for w in ['win','strategy','tips','how to']):
+        opts = [
+            f"@{username} {get_strategy_tip()} Play at {GAME_LINK}",
+            f"@{username} Master the dimensions. {random.choice(STRATEGY_TIPS)} {GAME_LINK}",
+            f"@{username} Think ahead. Think 9D. {GAME_LINK} 🎯"
+        ]
+    elif any(w in ml for w in ['hard','difficult','complex']):
+        opts = [
+            f"@{username} Too hard? That means you're getting smarter! {GAME_LINK} 🧠",
+            f"@{username} Complexity = fun! Keep practicing at {GAME_LINK}",
+            f"@{username} The best challenges make the best players. {GAME_LINK}"
+        ]
+    elif any(w in ml for w in ['dimension','9d','dimensional']):
+        opts = [
+            f"@{username} 9 dimensions. Infinite strategy. Experience it: {GAME_LINK}",
+            f"@{username} Dimensional mastery awaits. {GAME_LINK} 🌌",
+            f"@{username} Think beyond 3D. Think 9D: {GAME_LINK}"
+        ]
+    elif any(w in ml for w in ['gm','good morning','morning']):
+        opts = [
+            f"@{username} GM! Time to think in 9D! {GAME_LINK} ☀️🎮",
+            f"@{username} Good morning, strategist! Grids are waiting: {GAME_LINK}",
+            f"@{username} Morning! Your brain is fresh. Perfect for 9D: {GAME_LINK}"
+        ]
+    elif any(w in ml for w in ['gn','good night','night']):
+        opts = [
+            f"@{username} GN! Dream in 9 dimensions! {GAME_LINK} 🌙🎮",
+            f"@{username} Good night! Tomorrow: more 9D strategy at {GAME_LINK}",
+            f"@{username} Rest well, champion. The grid awaits: {GAME_LINK}"
+        ]
+    else:
+        opts = [
+            f"@{username} {random.choice(MOTIVATIONAL)} {GAME_LINK}",
+            f"@{username} {get_personality_line()} {GAME_LINK}",
+            f"@{username} Ready for the ultimate strategy challenge? {GAME_LINK}",
+            f"@{username} {random.choice(GAME_FACTS)} {GAME_LINK}",
+            f"@{username} {random.choice(PERSONALITY_TONES['competitive'])} {GAME_LINK}"
+        ]
+    resp = random.choice(opts)
+    if len(resp) > TWITTER_CHAR_LIMIT:
+        max_l = TWITTER_CHAR_LIMIT - len(f"@{username} \n\n{GAME_LINK}")
+        resp = f"@{username} {get_personality_line()[:max_l]}\n\n{GAME_LINK}"
+    return resp
 
 def bot_respond():
     processed = load_json_set(PROCESSED_MENTIONS_FILE)
     try:
-        me = client.get_me(user_auth=True)
-        if not me.data:
-            return
+        me = client.get_me()
+        if not me or not me.data: return
         mentions = client.get_users_mentions(me.data.id, max_results=50, tweet_fields=["author_id", "text"])
-        if not mentions.data:
-            return
-        for mention in mentions.data:
-            if str(mention.id) in processed:
-                continue
-            user_id = mention.author_id
-            user_data = client.get_user(id=user_id)
-            if not user_data.data:
-                continue
-            username = user_data.data.username
-            user_message = mention.text.replace(f"@{me.data.username}", "").strip().lower()
-            response = generate_contextual_response(username, user_message)  # your function
-            if safe_post_tweet(response, in_reply_to_tweet_id=mention.id):
-                client.like(mention.id)
-                processed.add(str(mention.id))
-                logging.info(f"Replied to @{username}")
+        if not mentions.data: return
+        for m in mentions.data:
+            if str(m.id) in processed: continue
+            uid = m.author_id
+            ud = client.get_user(id=uid)
+            if not ud or not ud.data: continue
+            un = ud.data.username
+            umsg = m.text.replace(f"@{me.data.username}", "").strip().lower()
+            resp = generate_contextual_response(un, umsg)
+            if safe_post_tweet(resp, in_reply_to_tweet_id=m.id):
+                client.like(m.id)
+                processed.add(str(m.id))
+                logging.info(f"Replied @{un}")
             else:
-                logging.error(f"Reply to @{username} failed")
+                logging.error(f"Reply @{un} failed")
         save_json_set(processed, PROCESSED_MENTIONS_FILE)
     except Exception as e:
-        logging.error(f"Mentions processing error: {e}")
+        logging.error(f"Mentions error: {e}")
 
-# Paste your generate_contextual_response, bot_retweet_hunt, bot_diagnostic here (replace client.create_tweet with safe_post_tweet)
+def bot_retweet_hunt():
+    q = "(tic-tac-toe OR tictactoe OR strategy games OR puzzle games OR board games OR gaming) filter:media min_faves:5 -is:retweet"
+    try:
+        tweets = client.search_recent_tweets(query=q, max_results=20)
+        if not tweets.data: return
+        for t in tweets.data:
+            if random.random() > 0.75:
+                try:
+                    client.retweet(t.id)
+                    logging.info(f"RT {t.id}")
+                except:
+                    pass
+    except Exception as e:
+        logging.error(f"Search/RT fail: {e}")
+
+def bot_diagnostic():
+    diag = f"🎮 9DTTT DIAGNOSTIC 🎮\n\nSystem Status: ONLINE\nGrid Status: ACTIVE\nDimensions: ALL 9 OPERATIONAL\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
+    if safe_post_tweet(diag[:TWITTER_CHAR_LIMIT]):
+        logging.info("Diagnostic posted")
+    else:
+        logging.error("Diagnostic failed")
 
 # ------------------------------------------------------------
-# SCHEDULER + ACTIVATION
+# SCHEDULER + STARTUP
 # ------------------------------------------------------------
 scheduler = BackgroundScheduler()
 scheduler.add_job(bot_broadcast, 'interval', minutes=random.randint(BROADCAST_MIN_INTERVAL, BROADCAST_MAX_INTERVAL))
@@ -318,25 +514,29 @@ scheduler.start()
 logging.info(f"{BOT_NAME} ONLINE 🎮")
 
 try:
-    activation_messages = [ ... ]  # your list
-    activation_msg = random.choice(activation_messages)
-    if len(activation_msg) > TWITTER_CHAR_LIMIT:
-        activation_msg = activation_msg[:TWITTER_CHAR_LIMIT - 20] + "... " + GAME_LINK
-    if safe_post_tweet(activation_msg):
-        logging.info("Activation message posted")
+    activation_msgs = [
+        f"🎮 {BOT_NAME} ACTIVATED 🎮\n\n9-dimensional grid online.\nStrategy systems operational.\nReady to challenge your mind?\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}",
+        f"🔌 SYSTEM BOOT COMPLETE 🔌\n\n{BOT_NAME} online.\nAll 9 dimensions loaded.\nGrid ready for strategic combat.\n\n{get_personality_line()}\n\n🎮 {GAME_LINK}",
+        f"📡 GRID INITIALIZED 📡\n\n9D Tic-Tac-Toe system active.\nPlayers welcome. Strategies encouraged.\nVictory awaits the bold.\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
+    ]
+    msg = random.choice(activation_msgs)
+    if len(msg) > TWITTER_CHAR_LIMIT:
+        msg = f"🎮 {BOT_NAME} ONLINE 🎮\n\n9D Grid Active\n{random.choice(MOTIVATIONAL)[:100]}\n\n🕹️ {GAME_LINK}"
+    if safe_post_tweet(msg):
+        logging.info("Activation posted")
     else:
-        logging.warning("Activation tweet failed (may be duplicate or tier issue)")
+        logging.warning("Activation failed (duplicate or tier issue?)")
 except Exception as e:
     logging.warning(f"Activation error: {e}")
 
 # ------------------------------------------------------------
-# MAIN LOOP
+# MAIN
 # ------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        logging.info(f"{BOT_NAME} entering main loop. Monitoring for strategy challenges...")
+        logging.info(f"{BOT_NAME} main loop - monitoring...")
         while True:
             time.sleep(300)
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
-        logging.info(f"{BOT_NAME} powering down. The grid awaits your return.")
+        logging.info(f"{BOT_NAME} shutdown. Grid awaits return.")
