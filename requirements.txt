@@ -1,0 +1,6 @@
+# requirements.txt
+tweepy>=4.14.0
+flask>=3.0.0          # Recent stable; Flask 3.x is current
+requests>=2.28.0
+apscheduler>=3.10.0   # Safe recent version; 3.11.2 is latest
+python-dotenv>=1.0.0  # Optional but strongly recommended — your code uses os.getenv heavily
