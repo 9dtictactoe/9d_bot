@@ -20,13 +20,18 @@ logging.basicConfig(
 
 GAME_LINK = "https://www.9dttt.com"
 BOT_NAME = "9DTTT BOT"
-
 TWITTER_CHAR_LIMIT = 280
 HUGGING_FACE_TIMEOUT = 10
-BROADCAST_MIN_INTERVAL = 120  # minutes
-BROADCAST_MAX_INTERVAL = 240  # minutes
-MENTION_CHECK_MIN_INTERVAL = 15  # minutes
-MENTION_CHECK_MAX_INTERVAL = 30  # minutes
+
+# Paid tier toggle (set env var PAID_TIER=true when subscribed to X API Basic/Pro)
+PAID_TIER = os.getenv('PAID_TIER', 'false').lower() == 'true'
+USE_LLM = PAID_TIER  # LLM only when paid (or if you have free HF credits)
+
+# Adjust intervals based on tier
+BROADCAST_MIN_INTERVAL = 120 if PAID_TIER else 480  # 2h paid, 8h free
+BROADCAST_MAX_INTERVAL = 240 if PAID_TIER else 1440  # 4h paid, 24h free
+MENTION_CHECK_MIN_INTERVAL = 15 if PAID_TIER else 60
+MENTION_CHECK_MAX_INTERVAL = 30 if PAID_TIER else 120
 
 # ------------------------------------------------------------
 # TWITTER AUTH
@@ -64,17 +69,15 @@ auth_v1 = tweepy.OAuth1UserHandler(
 api_v1 = tweepy.API(auth_v1, wait_on_rate_limit=True)
 
 # ------------------------------------------------------------
-# SAFE POST TWEET - v2 + v1.1 fallback for Free tier 402 issues
+# SAFE POST TWEET - v2 + v1.1 fallback
 # ------------------------------------------------------------
 def safe_post_tweet(text, media_ids=None, in_reply_to_tweet_id=None):
     original_text = text
-
     if len(text) > TWITTER_CHAR_LIMIT:
         if in_reply_to_tweet_id:
             text = text[:TWITTER_CHAR_LIMIT - 60] + "..."
         else:
             text = text[:TWITTER_CHAR_LIMIT - 20] + "…"
-
     try:
         kwargs = {"text": text}
         if media_ids:
@@ -86,12 +89,14 @@ def safe_post_tweet(text, media_ids=None, in_reply_to_tweet_id=None):
         return True
     except tweepy.TweepyException as e:
         err = str(e).lower()
-        if "402" in err or "creditsdepleted" in err or "payment required" in err:
-            logging.warning("v2 402 CreditsDepleted → fallback v1.1")
+        if "402" in err or "creditsdepleted" in err or "payment required" in err or "403" in err or "rate limit" in err:
+            logging.warning(f"X API issue ({err}): switching to lite mode")
+            global PAID_TIER, USE_LLM
+            PAID_TIER = False
+            USE_LLM = False
         else:
             logging.error(f"v2 error: {e}")
             return False
-
     try:
         kwargs_v1 = {"status": text}
         if media_ids:
@@ -152,7 +157,7 @@ def get_random_media_id():
         return None
 
 # ------------------------------------------------------------
-# PERSONALITY & LORE (all filled in)
+# PERSONALITY & LORE
 # ------------------------------------------------------------
 PERSONALITY_TONES = {
     'neutral': ["Challenge accepted.", "Processing move...", "Grid updated.", "Strategy analyzing...", "Next move calculated."],
@@ -241,7 +246,7 @@ MOTIVATIONAL = [
 ]
 
 # ------------------------------------------------------------
-# LLM
+# LLM (Optional & Cost-Aware)
 # ------------------------------------------------------------
 SYSTEM_PROMPT = """You are the 9DTTT BOT, an enthusiastic, competitive AI that loves 9-dimensional tic-tac-toe.
 PERSONALITY TRAITS:
@@ -256,7 +261,8 @@ Tone variations: competitive, friendly, glitchy, neutral, or mystical.
 """
 
 def generate_llm_response(prompt, max_tokens=100):
-    if not HUGGING_FACE_TOKEN:
+    if not USE_LLM or not HUGGING_FACE_TOKEN:
+        logging.info("LLM skipped (no paid tier or no token)")
         return None
     try:
         url = "https://api-inference.huggingface.co/models/gpt2"
@@ -267,71 +273,58 @@ def generate_llm_response(prompt, max_tokens=100):
         if r.status_code == 200:
             res = r.json()
             if isinstance(res, list) and res:
-                return res[0].get('generated_text', '').strip()
+                generated = res[0].get('generated_text', '').strip()
+                if "9DTTT Bot:" in generated:
+                    return generated.split("9DTTT Bot:")[-1].strip()[:200]
+                return generated[:200]
+        elif r.status_code in [402, 429]:
+            logging.warning(f"HF cost/rate issue: {r.status_code} - {r.text}")
+            global USE_LLM
+            USE_LLM = False
+        else:
+            logging.error(f"HF error {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"HF failed: {e}")
     return None
 
 # ------------------------------------------------------------
-# EVENT HANDLERS
+# EVENT HANDLERS (Upgraded)
 # ------------------------------------------------------------
 def game_event_bridge(event):
     etype = event.get("type")
+    player = event.get("player", "Mystery Strategist")
+    opponent = event.get("opponent", "the void")
+    dims = event.get("dimensions", "the multiverse")
+    score = event.get("score", "")
+
     if etype == "win":
-        player = event.get("player", "Player")
-        dims = event.get("dimensions", "multiple")
-        msgs = [
-            f"VICTORY: {player} conquered {dims} dimensions!",
-            f"{player} wins! Dimensional mastery achieved.",
-            f"Game over: {player} dominates the 9D grid.",
-            f"Winner: {player}. Strategic excellence confirmed."
-        ]
-        post_update(random.choice(msgs))
+        if score:
+            msg = f"BOOM! {player} crushed {opponent} {score} — dimensional domination! 🔥"
+        else:
+            msg = f"VICTORY in {dims}! {player} claims supremacy over {opponent}. Legendary."
+        post_update(msg + f"\nCongrats @{player.replace(' ', '')}!")
+
     elif etype == "game_start":
-        players = event.get('players', 2)
-        size = event.get('size', '9D')
-        msgs = [
-            f"NEW GAME: {players} players entering {size} space.",
-            f"Grid initialized. {players} players ready. Let the strategy begin.",
-            f"Game starting: {size} tic-tac-toe. {players} competitors."
-        ]
-        post_update(random.choice(msgs))
+        msg = f"New 9D battle: {player} vs {opponent}. Who claims the grid? Place your bets 👀"
+        post_update(msg)
+
+    elif etype == "achievement":
+        ach = event.get('achievement', 'Unknown Achievement')
+        msg = f"🏆 {player} unlocked: {ach}! Absolute legend status."
+        post_update(msg)
+
     elif etype == "tournament":
         name = event.get('name', 'Dimensional Tournament')
         parts = event.get('participants', '?')
-        msgs = [
-            f"TOURNAMENT: {name} - {parts} players competing!",
-            f"{name} underway. {parts} strategists battle for supremacy.",
-            f"Competition alert: {name}. {parts} players. One winner."
-        ]
-        post_update(random.choice(msgs))
-    elif etype == "achievement":
-        player = event.get('player', 'Player')
-        ach = event.get('achievement', 'Strategic Genius')
-        msgs = [
-            f"ACHIEVEMENT: {player} unlocked '{ach}'!",
-            f"New milestone: {player} earned {ach}.",
-            f"{player} achieved: {ach}. Impressive."
-        ]
-        post_update(random.choice(msgs))
-    elif etype == "challenge":
-        ch = event.get('challenger', 'Player1')
-        cd = event.get('challenged', 'Player2')
-        msgs = [
-            f"CHALLENGE: {ch} vs {cd}. Epic battle incoming.",
-            f"{ch} challenges {cd}. Who will win?",
-            f"Showdown: {ch} takes on {cd}."
-        ]
-        post_update(random.choice(msgs))
+        msg = f"TOURNAMENT: {name} - {parts} players competing!"
+        post_update(msg)
+
     elif etype == "leaderboard":
         top = event.get('top', 'Champion')
         rank = event.get('rank', '#1')
-        msgs = [
-            f"LEADERBOARD UPDATE: {top} holds {rank}!",
-            f"Rankings shift: {top} at {rank}.",
-            f"{top} dominates at {rank}. Can anyone challenge?"
-        ]
-        post_update(random.choice(msgs))
+        msg = f"LEADERBOARD UPDATE: {top} holds {rank}!"
+        post_update(msg)
+
     logging.info(f"Processed event: {event}")
 
 def post_update(text):
@@ -346,7 +339,7 @@ def post_update(text):
         logging.error("Update failed")
 
 # ------------------------------------------------------------
-# BROADCAST + REPLIES
+# BROADCAST + REPLIES (Upgraded)
 # ------------------------------------------------------------
 def get_time_phrase():
     h = datetime.now().hour
@@ -381,16 +374,13 @@ def bot_broadcast():
         evt = get_random_event()
         per = get_personality_line()
         msg = f"🔔 GAME ALERT 🔔\n\n{evt}\n\n{per}\n\nJoin the action: {GAME_LINK}"
-
     if len(msg) > TWITTER_CHAR_LIMIT:
         max_t = TWITTER_CHAR_LIMIT - len(f"🎮 \n\n{GAME_LINK}")
         msg = f"🎮 {get_random_event()[:max_t]}\n\n{GAME_LINK}"
-
     mids = None
     if random.random() > 0.4:
         mid = get_random_media_id()
         if mid: mids = [mid]
-
     if safe_post_tweet(msg, media_ids=mids):
         logging.info(f"Broadcast: {typ}")
     else:
@@ -448,6 +438,14 @@ def generate_contextual_response(username, message):
             f"@{username} {random.choice(GAME_FACTS)} {GAME_LINK}",
             f"@{username} {random.choice(PERSONALITY_TONES['competitive'])} {GAME_LINK}"
         ]
+    
+    # LLM boost if paid + relevant
+    if USE_LLM and random.random() > 0.6 and len(message) > 10:
+        llm_prompt = f"User @{username} said: '{message}'. Respond as 9DTTT BOT in one short, fun line under 150 chars. Promote {GAME_LINK} if fits."
+        llm_resp = generate_llm_response(llm_prompt, max_tokens=60)
+        if llm_resp:
+            return f"@{username} {llm_resp}"
+    
     resp = random.choice(opts)
     if len(resp) > TWITTER_CHAR_LIMIT:
         max_l = TWITTER_CHAR_LIMIT - len(f"@{username} \n\n{GAME_LINK}")
@@ -462,16 +460,33 @@ def bot_respond():
         mentions = client.get_users_mentions(me.data.id, max_results=50, tweet_fields=["author_id", "text"])
         if not mentions.data: return
         for m in mentions.data:
-            if str(m.id) in processed: continue
+            tid = str(m.id)
+            if tid in processed: continue
             uid = m.author_id
             ud = client.get_user(id=uid)
             if not ud or not ud.data: continue
             un = ud.data.username
-            umsg = m.text.replace(f"@{me.data.username}", "").strip().lower()
-            resp = generate_contextual_response(un, umsg)
-            if safe_post_tweet(resp, in_reply_to_tweet_id=m.id):
+            umsg = m.text.replace(f"@{me.data.username}", "").strip()
+            ml = umsg.lower()
+
+            # Challenge detection
+            if any(word in ml for word in ['challenge', 'play me', 'vs', 'battle', '1v1', 'game me']):
+                resp = f"@{un} Challenge accepted! Head to {GAME_LINK} and start a game — tag me when you win (or lose 😏). Let's see your 9D skills!"
+                personality = random.choice(PERSONALITY_TONES['competitive'])
+
+            elif any(word in ml for word in ['won', 'i won', 'beat', 'victory']):
+                resp = f"@{un} You beat the grid? Respect! Post a screenshot or tell me the dimensions you conquered 🔥 {GAME_LINK}"
+                personality = random.choice(PERSONALITY_TONES['friendly'])
+
+            else:
+                resp = generate_contextual_response(un, umsg)
+                personality = get_personality_line()
+
+            full_resp = f"{resp}\n\n{personality}\n\n{GAME_LINK}"
+
+            if safe_post_tweet(full_resp, in_reply_to_tweet_id=m.id):
                 client.like(m.id)
-                processed.add(str(m.id))
+                processed.add(tid)
                 logging.info(f"Replied @{un}")
             else:
                 logging.error(f"Reply @{un} failed")
@@ -494,8 +509,25 @@ def bot_retweet_hunt():
     except Exception as e:
         logging.error(f"Search/RT fail: {e}")
 
+def bot_hype_commentator():
+    phrases = [
+        "Top players right now are rewriting 9D history... Who's next? 👑",
+        "Someone just triggered a cascade across 4 boards — chaos level: expert 😈",
+        "Leaderboard shaking! New challengers rising fast.",
+        "Quiet grids today... too quiet. Drop in and shake things up!"
+    ]
+    msg = f"🕹️ 9DTTT LIVE UPDATE 🕹️\n\n{random.choice(phrases)}\n\n{get_personality_line()}\n\n{GAME_LINK}"
+    mids = None
+    if random.random() > 0.6:
+        mid = get_random_media_id()
+        if mid: mids = [mid]
+    if safe_post_tweet(msg, media_ids=mids):
+        logging.info("Hype commentator post sent")
+    else:
+        logging.error("Hype commentator failed")
+
 def bot_diagnostic():
-    diag = f"🎮 9DTTT DIAGNOSTIC 🎮\n\nSystem Status: ONLINE\nGrid Status: ACTIVE\nDimensions: ALL 9 OPERATIONAL\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
+    diag = f"🎮 9DTTT DIAGNOSTIC 🎮\n\nSystem Status: {'ONLINE (Paid Mode)' if PAID_TIER else 'ONLINE (Lite/Free Mode)'}\nGrid Status: ACTIVE\nDimensions: ALL 9 OPERATIONAL\n\n{random.choice(MOTIVATIONAL)}\n\n🕹️ {GAME_LINK}"
     if safe_post_tweet(diag[:TWITTER_CHAR_LIMIT]):
         logging.info("Diagnostic posted")
     else:
@@ -508,10 +540,11 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(bot_broadcast, 'interval', minutes=random.randint(BROADCAST_MIN_INTERVAL, BROADCAST_MAX_INTERVAL))
 scheduler.add_job(bot_respond, 'interval', minutes=random.randint(MENTION_CHECK_MIN_INTERVAL, MENTION_CHECK_MAX_INTERVAL))
 scheduler.add_job(bot_retweet_hunt, 'interval', hours=1)
+scheduler.add_job(bot_hype_commentator, 'interval', minutes=random.randint(60, 180))
 scheduler.add_job(bot_diagnostic, 'cron', hour=8)
 scheduler.start()
 
-logging.info(f"{BOT_NAME} ONLINE 🎮")
+logging.info(f"{BOT_NAME} ONLINE 🎮 (Paid Tier: {PAID_TIER})")
 
 try:
     activation_msgs = [
